@@ -12,12 +12,16 @@ const view = document.getElementById("view"), toast = document.getElementById("t
    dangerouslyAllowBrowser client mode). Bring your own free key for whichever
    you prefer; OPTIMUS never sends your key anywhere but that provider. */
 const PROVIDERS = {
-  gemini: { label: "Google Gemini", keyUrl: "https://aistudio.google.com/apikey", keyHint: "Free key from Google AI Studio", defaultModel: "gemini-3.8-flash", supportsSearch: true, supportsImage: true, supportsVoice: true },
+  gemini: { label: "Google Gemini", keyUrl: "https://aistudio.google.com/apikey", keyHint: "Free key from Google AI Studio", defaultModel: "gemini-2.5-flash", supportsSearch: true, supportsImage: true, supportsVoice: true },
   groq: { label: "Groq", keyUrl: "https://console.groq.com/keys", keyHint: "Free key, very fast responses", defaultModel: "llama-3.3-70b-versatile", supportsSearch: false, supportsImage: false, supportsVoice: true },
   openrouter: { label: "OpenRouter", keyUrl: "https://openrouter.ai/keys", keyHint: "Free key, access to many free models", defaultModel: "meta-llama/llama-3.3-70b-instruct:free", supportsSearch: false, supportsImage: false, supportsVoice: false },
 };
 function keyStoreKey(p) { return "optimus_key_" + p; }
 function modelStoreKey(p) { return "optimus_model_" + p; }
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com";
+const GEMINI_API_VERSIONS = ["v1beta", "v1"];
+const GEMINI_FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"];
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 const state = {
   provider: localStorage.getItem("optimus_provider") || "gemini",
@@ -123,30 +127,131 @@ function friendlyError(msg, status, provider) {
   if (status >= 500) return `${name} is having trouble right now (${status}). Try again in a moment, or switch provider in Settings.`;
   return msg || `${name} returned an unexpected error.`;
 }
-async function apiFetch(url, opts, provider) {
+function makeApiError(msg, status, provider, rawMessage) {
+  const err = new Error(msg);
+  err.status = status;
+  err.provider = provider;
+  err.rawMessage = rawMessage || "";
+  return err;
+}
+function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+function retryDelayMs(attempt) { return Math.min(3500, 350 * (2 ** attempt)) + Math.floor(Math.random() * 120); }
+function normalizeGeminiModel(model) { return String(model || "").trim().replace(/^models\//i, ""); }
+function isGeminiModelCandidate(name) {
+  return /gemini/i.test(name) && !/image|tts|embed|live|audio/i.test(name);
+}
+function parseErrorMessage(body, status) {
+  if (body && typeof body === "object") return body?.error?.message || body?.error || body?.message || `error ${status}`;
+  return String(body || `error ${status}`);
+}
+function isGeminiModelError(err) {
+  if ((err?.status || 0) === 404) return true;
+  const msg = String(err?.rawMessage || err?.message || "");
+  return /model|not found|unsupported|not available|deprecated|unknown model/i.test(msg);
+}
+let geminiModelCache = { apiKey: "", at: 0, names: [] };
+async function fetchGeminiModelNames(apiKey) {
+  if (geminiModelCache.apiKey === apiKey && Date.now() - geminiModelCache.at < 10 * 60 * 1000 && geminiModelCache.names.length) {
+    return geminiModelCache.names.slice();
+  }
+  let names = [];
+  let lastErr = null;
+  for (const version of GEMINI_API_VERSIONS) {
+    try {
+      const d = await apiFetch(`${GEMINI_API_BASE}/${version}/models?pageSize=200`, { headers: { "x-goog-api-key": apiKey } }, "gemini", { retries: 1 });
+      const got = (d?.models || [])
+        .filter(m => (m.supportedGenerationMethods || []).includes("generateContent") && isGeminiModelCandidate(m.name))
+        .map(m => normalizeGeminiModel(m.name));
+      if (got.length) names = names.concat(got);
+    } catch (e) { lastErr = e; }
+  }
+  names = [...new Set(names)];
+  if (!names.length && lastErr) throw lastErr;
+  geminiModelCache = { apiKey, at: Date.now(), names };
+  return names.slice();
+}
+async function apiFetch(url, opts, provider, { retries = 0 } = {}) {
   if (typeof navigator !== "undefined" && navigator.onLine === false) throw new Error("You appear to be offline. Check your internet connection and try again.");
-  let r;
-  try { r = await fetch(url, opts); }
-  catch { throw new Error("Couldn't reach " + (PROVIDERS[provider]?.label || "the AI provider") + ". Check your internet connection, or an ad blocker/extension may be blocking the request."); }
-  let d = {}; try { d = await r.json(); } catch { }
-  if (!r.ok) throw new Error(friendlyError(d?.error?.message || d?.error || `error ${r.status}`, r.status, provider));
-  return d;
+  let netErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let r;
+    try { r = await fetch(url, opts); }
+    catch {
+      netErr = new Error("Couldn't reach " + (PROVIDERS[provider]?.label || "the AI provider") + ". Check your internet connection, or an ad blocker/extension may be blocking the request.");
+      if (attempt < retries) { await sleep(retryDelayMs(attempt)); continue; }
+      throw netErr;
+    }
+    const ct = r.headers?.get?.("content-type") || "";
+    let text = "";
+    let d = null;
+    try {
+      if (ct.includes("application/json")) d = await r.json();
+      else { text = await r.text(); d = text ? JSON.parse(text) : null; }
+    } catch {
+      if (ct.includes("application/json")) {
+        throw makeApiError(`${PROVIDERS[provider]?.label || "The AI provider"} returned a malformed JSON response. Please try again.`, r.status, provider);
+      }
+      d = null;
+    }
+    if (!r.ok) {
+      const rawMsg = parseErrorMessage(d ?? text, r.status);
+      const err = makeApiError(friendlyError(rawMsg, r.status, provider), r.status, provider, rawMsg);
+      if (attempt < retries && RETRYABLE_STATUSES.has(r.status)) { await sleep(retryDelayMs(attempt)); continue; }
+      throw err;
+    }
+    if (!d || typeof d !== "object") throw makeApiError(`${PROVIDERS[provider]?.label || "The AI provider"} returned an unreadable response. Please try again.`, r.status || 502, provider);
+    return d;
+  }
+  throw netErr || new Error("Request failed");
 }
 
 /* ---- Gemini (native format; supports search grounding, images, voice) ---- */
 async function callGemini(model, apiKey, { system, messages, search, thinking }) {
-  const contents = messages.map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }, ...(m.parts || [])] }));
-  const payload = { contents };
-  if (system) payload.systemInstruction = { parts: [{ text: system }] };
-  if (thinking && model.startsWith("gemini-3.8-flash")) payload.generationConfig = { thinkingConfig: { thinkingLevel: "medium" } };
-  if (search) payload.tools = [{ google_search: {} }];
-  const d = await apiFetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: "POST", headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" }, body: JSON.stringify(payload) }, "gemini");
-  const parts = d?.candidates?.[0]?.content?.parts || [];
-  const text = parts.filter(p => p.text && !p.thought).map(p => p.text).join("") || (d?.promptFeedback?.blockReason ? `The request was blocked by Google's safety filters (${d.promptFeedback.blockReason}).` : "");
-  const chunks = d?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-  const seen = new Set(), sources = [];
-  for (const c of chunks) if (c.web?.uri && !seen.has(c.web.uri)) { seen.add(c.web.uri); sources.push({ uri: c.web.uri, title: c.web.title }); }
-  return { text: text || "I received an empty response. Please try again.", sources: sources.slice(0, 6) };
+  const preferred = normalizeGeminiModel(model) || PROVIDERS.gemini.defaultModel;
+  let models = [preferred, ...GEMINI_FALLBACK_MODELS].map(normalizeGeminiModel).filter(Boolean);
+  try {
+    const available = await fetchGeminiModelNames(apiKey);
+    if (available.length) models = [preferred, ...available, ...GEMINI_FALLBACK_MODELS].map(normalizeGeminiModel).filter(Boolean);
+  } catch { /* Model listing is best effort; send request anyway. */ }
+  models = [...new Set(models)];
+  let lastErr = null;
+  for (const chosen of models) {
+    const contents = messages.map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }, ...(m.parts || [])] }));
+    const payload = { contents };
+    if (system) payload.systemInstruction = { parts: [{ text: system }] };
+    if (thinking && /gemini-.*flash/i.test(chosen)) payload.generationConfig = { thinkingConfig: { thinkingLevel: "medium" } };
+    if (search) payload.tools = [{ google_search: {} }];
+    for (const version of GEMINI_API_VERSIONS) {
+      try {
+        const d = await apiFetch(`${GEMINI_API_BASE}/${version}/models/${chosen}:generateContent`, { method: "POST", headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" }, body: JSON.stringify(payload) }, "gemini", { retries: 2 });
+        const parts = d?.candidates?.[0]?.content?.parts || [];
+        const text = parts.filter(p => p.text && !p.thought).map(p => p.text).join("") || (d?.promptFeedback?.blockReason ? `The request was blocked by Google's safety filters (${d.promptFeedback.blockReason}).` : "");
+        const chunks = d?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+        const seen = new Set(), sources = [];
+        for (const c of chunks) if (c.web?.uri && !seen.has(c.web.uri)) { seen.add(c.web.uri); sources.push({ uri: c.web.uri, title: c.web.title }); }
+        if (chosen !== preferred && state.provider === "gemini" && normalizeGeminiModel(state.model) === preferred) {
+          state.model = chosen;
+          localStorage.setItem(modelStoreKey("gemini"), chosen);
+          const pill = document.getElementById("modelPill"); if (pill) pill.textContent = "● " + chosen;
+          notify(`Your selected Gemini model wasn't available. Switched to ${chosen}.`);
+        }
+        return { text: text || "I received an empty response. Please try again.", sources: sources.slice(0, 6) };
+      } catch (e) {
+        lastErr = e;
+        if (search && /google_search|tools|grounding/i.test(String(e?.rawMessage || e?.message || ""))) {
+          notify("Live search isn't available on this Gemini model right now, so OPTIMUS answered without search grounding.");
+          return callGemini(chosen, apiKey, { system, messages, search: false, thinking });
+        }
+        if (isGeminiModelError(e)) break;
+        if (version === GEMINI_API_VERSIONS[GEMINI_API_VERSIONS.length - 1]) throw e;
+      }
+    }
+    if (lastErr && !isGeminiModelError(lastErr)) throw lastErr;
+  }
+  if (lastErr && isGeminiModelError(lastErr)) {
+    throw new Error("No supported Gemini chat model worked with this key. In Settings, click “Load available models”, choose one, and save.");
+  }
+  throw lastErr || new Error("Gemini request failed.");
 }
 
 /* ---- OpenAI-compatible chat (Groq, OpenRouter) ---- */
@@ -608,9 +713,8 @@ async function loadModels() {
   try {
     let names = [];
     if (state.provider === "gemini") {
-      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", { headers: { "x-goog-api-key": key } });
-      const d = await r.json(); if (!r.ok) throw new Error(friendlyError(d?.error?.message || "Could not load models", r.status, "gemini"));
-      names = d.models.filter(m => (m.supportedGenerationMethods || []).includes("generateContent") && /gemini/i.test(m.name) && !/image|tts|embed|live|audio/i.test(m.name)).map(m => m.name.replace("models/", ""));
+      names = await fetchGeminiModelNames(key);
+      if (!names.length) names = GEMINI_FALLBACK_MODELS.slice();
     } else if (state.provider === "groq") {
       const d = await apiFetch("https://api.groq.com/openai/v1/models", { headers: { Authorization: `Bearer ${key}` } }, "groq");
       names = (d.data || []).map(m => m.id).filter(id => !/whisper|guard|tts/i.test(id)).sort();
